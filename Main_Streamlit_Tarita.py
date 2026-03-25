@@ -1,6 +1,5 @@
 import base64
 import mimetypes
-from io import BytesIO
 from urllib.parse import quote
 
 import requests
@@ -30,6 +29,8 @@ HEADERS = {
     "Authorization": f"Bearer {GITHUB_TOKEN}",
     "X-GitHub-Api-Version": "2022-11-28",
 }
+
+BUILD_LABEL = "2026-03-26 download-fix-2"
 
 
 # =========================
@@ -96,9 +97,24 @@ def github_download_file(path: str):
     if data.get("type") != "file":
         raise ValueError("指定パスはファイルではありません。")
 
-    encoded = data.get("content", "").replace("\n", "")
-    file_bytes = base64.b64decode(encoded)
+    # Large files return empty content here, so fetch the raw body instead.
+    if data.get("encoding") == "base64" and data.get("content"):
+        encoded = data["content"].replace("\n", "")
+        file_bytes = base64.b64decode(encoded)
+        return file_bytes, data.get("sha")
+
+    raw_headers = dict(HEADERS)
+    raw_headers["Accept"] = "application/vnd.github.raw+json"
+    raw_res = requests.get(url, headers=raw_headers, params=params, timeout=60)
+    raw_res.raise_for_status()
+    file_bytes = raw_res.content
     return file_bytes, data.get("sha")
+
+
+@st.cache_data(show_spinner=False)
+def get_download_bytes(path: str, sha: str):
+    file_bytes, _ = github_download_file(path)
+    return file_bytes
 
 
 def github_upload_file(path: str, file_bytes: bytes, message: str):
@@ -157,6 +173,7 @@ def list_files_recursive(path: str = ""):
             "name": data["name"],
             "path": data["path"],
             "size": data.get("size", 0),
+            "sha": data.get("sha"),
             "download_url": data.get("download_url"),
         })
         return results, res
@@ -169,6 +186,7 @@ def list_files_recursive(path: str = ""):
                     "name": item["name"],
                     "path": item["path"],
                     "size": item.get("size", 0),
+                    "sha": item.get("sha"),
                     "download_url": item.get("download_url"),
                 })
             elif item["type"] == "dir":
@@ -193,6 +211,7 @@ def human_size(size: int) -> str:
 with st.sidebar:
     st.header("設定")
     target_folder = st.text_input("GitHub上の保存先フォルダ", value="")
+    st.caption(f"Build: {BUILD_LABEL}")
     st.caption(f"Repository: {GITHUB_OWNER}/{GITHUB_REPO}")
     st.caption(f"Branch: {GITHUB_BRANCH}")
 
@@ -258,15 +277,15 @@ with tab1:
 
                 with col2:
                     try:
-                        file_bytes, _ = github_download_file(file_info["path"])
                         mime_type = mimetypes.guess_type(file_info["name"])[0] or "application/octet-stream"
 
                         st.download_button(
                             label="ダウンロード",
-                            data=BytesIO(file_bytes),
+                            data=lambda path=file_info["path"], sha=file_info.get("sha", ""): get_download_bytes(path, sha),
                             file_name=file_info["name"],
                             mime=mime_type,
-                            key=f"download_{i}"
+                            key=f"download_{i}",
+                            on_click="ignore"
                         )
                     except Exception as e:
                         st.error(f"DL失敗: {e}")
